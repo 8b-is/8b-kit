@@ -1,0 +1,26 @@
+[package]
+name = "kit-core"
+version = "0.1.0"
+edition = "2024"
+description = "The 8b-kit decision core — egress allowlist, MEM8 wave substrate, Phoenix protocol, telemetry scrubber, in zero-dependency Rust"
+license = "MIT"
+repository = "https://github.com/8b-is/8b-kit"
+
+[lib]
+name = "kit_core"
+crate-type = ["staticlib", "rlib"]
+
+[features]
+default = []
+# Everything ON: links the mem|16-10 sovereign library (AGPL-3.0-only —
+# the night side). Off by default so the stable build keeps its MIT posture.
+nightly = ["mem16"]
+mem16 = ["dep:mem16-10"]
+
+[dependencies]
+mem16-10 = { git = "https://github.com/peterlodri-sec/mem-16-10.git", optional = true, default-features = false }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
