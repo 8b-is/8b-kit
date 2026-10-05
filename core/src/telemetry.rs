@@ -228,6 +228,29 @@ mod tests {
     }
 
     #[test]
+    fn c_buffer_requires_room_for_terminator_and_preserves_guards() {
+        let input = c"https://example.com/readme?q=private";
+        let expected = scrub_url(input.to_str().unwrap());
+        let capacity = expected.len() + 1;
+        let mut guarded = vec![0x7fu8; capacity + 2];
+        // SAFETY: input is a C literal; the interior has capacity writable bytes.
+        let short = unsafe {
+            kit_telemetry_scrub_url(input.as_ptr(), guarded.as_mut_ptr().add(1).cast(), capacity - 1)
+        };
+        assert_eq!(short, 0, "payload-only space must be rejected");
+        assert!(guarded.iter().all(|&byte| byte == 0x7f), "rejection must not write");
+        // SAFETY: the same interior now includes space for the terminator.
+        let written = unsafe {
+            kit_telemetry_scrub_url(input.as_ptr(), guarded.as_mut_ptr().add(1).cast(), capacity)
+        };
+        assert_eq!(written, expected.len());
+        assert_eq!(&guarded[1..1 + written], expected.as_bytes());
+        assert_eq!(guarded[1 + written], 0);
+        assert_eq!(guarded[0], 0x7f);
+        assert_eq!(guarded[capacity + 1], 0x7f, "must not write past capacity");
+    }
+
+    #[test]
     fn emails_and_ips_are_tagged() {
         assert_eq!(scrub_line("mail bob@example.com now"), "mail [EMAIL] now");
         assert_eq!(scrub_line("from 192.168.1.10 to 10.0.0.1"), "from [IP] to [IP]");
