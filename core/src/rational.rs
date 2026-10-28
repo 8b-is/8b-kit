@@ -29,10 +29,6 @@ impl Rational {
     pub const ZERO: Self = Self::integer(0);
     pub const ONE: Self = Self::integer(1);
 
-    pub fn double_value(self) -> f64 {
-        self.num as f64 / self.den as f64
-    }
-
     /// Checked addition, reducing the result.
     pub fn adding(self, other: Self) -> Option<Self> {
         let a = self.num as i64 * other.den as i64;
