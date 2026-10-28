@@ -12,7 +12,7 @@
 
 use std::io::{self, BufRead, Write};
 
-use kit_core::telemetry::{scrub_line, Aggregator};
+use kit_core::telemetry::{Aggregator, scrub_line};
 
 fn main() -> io::Result<()> {
     let stdin = io::stdin();
@@ -24,10 +24,13 @@ fn main() -> io::Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        lines += 1;
+        lines = lines
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("line count overflow"))?;
         // Belt and braces: even a line that claims to be scrubbed is passed
         // through the scrubber again before it is counted.
-        agg.observe_line(&scrub_line(&line));
+        agg.observe_line(&scrub_line(&line))
+            .map_err(io::Error::other)?;
     }
 
     let mut out = io::stdout().lock();
