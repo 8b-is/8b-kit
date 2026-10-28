@@ -37,7 +37,10 @@ pub fn scrub_url(url: &str) -> String {
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     // Strip userinfo (user:pass@).
     let host = authority.rsplit('@').next().unwrap_or("");
-    let path = rest[authority.len()..].split(['?', '#']).next().unwrap_or("");
+    let path = rest[authority.len()..]
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("");
     let path_hash = content_hash(path);
     format!("{scheme}://{host}/p:{}", &path_hash[..8])
 }
@@ -70,11 +73,10 @@ pub fn scrub_line(line: &str) -> String {
 }
 
 fn looks_like_email(token: &str) -> bool {
-    let Some(at) = token.find('@') else { return false };
-    at > 0
-        && at < token.len() - 1
-        && token[at + 1..].contains('.')
-        && !token.contains(['/', '?'])
+    let Some(at) = token.find('@') else {
+        return false;
+    };
+    at > 0 && at < token.len() - 1 && token[at + 1..].contains('.') && !token.contains(['/', '?'])
 }
 
 fn looks_like_ip(token: &str) -> bool {
@@ -92,11 +94,52 @@ fn looks_like_ip(token: &str) -> bool {
     is_v4() || is_v6()
 }
 
-/// A counting aggregator: token → occurrences, JSON-ready. Nothing else —
-/// aggregation is where privacy and data science meet.
+/// Retained-data limits, measured in unique keys and UTF-8 bytes (not characters).
+/// Map overhead and JSON rendering scratch are additional allocations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregationLimits {
+    pub max_keys: usize,
+    pub max_key_bytes: usize,
+    pub max_total_key_bytes: usize,
+}
+
+impl Default for AggregationLimits {
+    fn default() -> Self {
+        Self {
+            max_keys: 4096,
+            max_key_bytes: 1024,
+            max_total_key_bytes: 65_536,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AggregationError {
+    KeyLimit,
+    KeyBytesLimit,
+    TotalKeyBytesLimit,
+    CountOverflow,
+}
+
+impl std::fmt::Display for AggregationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::KeyLimit => "telemetry unique-key limit exceeded",
+            Self::KeyBytesLimit => "telemetry per-key byte limit exceeded",
+            Self::TotalKeyBytesLimit => "telemetry total key-byte limit exceeded",
+            Self::CountOverflow => "telemetry count overflow",
+        })
+    }
+}
+
+impl std::error::Error for AggregationError {}
+
+/// Bounded token → occurrence counts with deterministic JSON output.
 #[derive(Default)]
 pub struct Aggregator {
     counts: BTreeMap<String, u64>,
+    limits: AggregationLimits,
+    total_key_bytes: usize,
 }
 
 impl Aggregator {
@@ -104,23 +147,86 @@ impl Aggregator {
         Self::default()
     }
 
-    /// Count one token.
-    pub fn observe(&mut self, token: &str) {
-        *self.counts.entry(token.to_string()).or_insert(0) += 1;
-    }
-
-    /// Count every whitespace token in a (pre-scrubbed) line.
-    pub fn observe_line(&mut self, scrubbed_line: &str) {
-        for token in scrubbed_line.split_whitespace() {
-            self.observe(token);
+    pub fn with_limits(limits: AggregationLimits) -> Self {
+        Self {
+            counts: BTreeMap::new(),
+            limits,
+            total_key_bytes: 0,
         }
     }
 
-    /// Merge another aggregator in.
-    pub fn merge(&mut self, other: &Aggregator) {
+    pub fn retained_key_bytes(&self) -> usize {
+        self.total_key_bytes
+    }
+
+    /// Preflight one new key without allocating or changing retained state.
+    fn admit_key(
+        &self,
+        token: &str,
+        keys: &mut usize,
+        bytes: &mut usize,
+    ) -> Result<(), AggregationError> {
+        if token.len() > self.limits.max_key_bytes {
+            return Err(AggregationError::KeyBytesLimit);
+        }
+        *keys = keys
+            .checked_add(1)
+            .filter(|n| *n <= self.limits.max_keys)
+            .ok_or(AggregationError::KeyLimit)?;
+        *bytes = bytes
+            .checked_add(token.len())
+            .filter(|n| *n <= self.limits.max_total_key_bytes)
+            .ok_or(AggregationError::TotalKeyBytesLimit)?;
+        Ok(())
+    }
+
+    /// Count one token. Rejection leaves all counts and byte accounting unchanged.
+    /// Existing keys remain admissible at capacity unless their count overflows.
+    pub fn observe(&mut self, token: &str) -> Result<(), AggregationError> {
+        if let Some(count) = self.counts.get_mut(token) {
+            *count = count
+                .checked_add(1)
+                .ok_or(AggregationError::CountOverflow)?;
+        } else {
+            let mut keys = self.counts.len();
+            let mut bytes = self.total_key_bytes;
+            self.admit_key(token, &mut keys, &mut bytes)?;
+            self.counts.insert(token.to_string(), 1);
+            self.total_key_bytes = bytes;
+        }
+        Ok(())
+    }
+
+    /// Count a pre-scrubbed line atomically. Scratch storage has the same limits
+    /// as this aggregator; rejection preserves the entire previous aggregate.
+    pub fn observe_line(&mut self, scrubbed_line: &str) -> Result<(), AggregationError> {
+        let mut staged = Self::with_limits(self.limits);
+        for token in scrubbed_line.split_whitespace() {
+            staged.observe(token)?;
+        }
+        self.merge(&staged)
+    }
+
+    /// Preflight against the destination's limits and count range before mutation.
+    /// On error, both aggregators remain unchanged.
+    pub fn merge(&mut self, other: &Aggregator) -> Result<(), AggregationError> {
+        let mut keys = self.counts.len();
+        let mut bytes = self.total_key_bytes;
         for (token, count) in &other.counts {
+            if let Some(existing) = self.counts.get(token) {
+                existing
+                    .checked_add(*count)
+                    .ok_or(AggregationError::CountOverflow)?;
+            } else {
+                self.admit_key(token, &mut keys, &mut bytes)?;
+            }
+        }
+        for (token, count) in &other.counts {
+            // Proven within u64 range above; &mut self excludes intervening writes.
             *self.counts.entry(token.clone()).or_insert(0) += count;
         }
+        self.total_key_bytes = bytes;
+        Ok(())
     }
 
     /// JSON-ready output: `{"token": count, ...}` sorted by count descending.
@@ -218,13 +324,18 @@ mod tests {
     fn credentials_do_not_split_the_same_page_aggregate() {
         let plain = scrub_url("https://example.com/readme");
         assert_eq!(plain, scrub_url("https://alice:secret@example.com/readme"));
-        assert_eq!(plain, scrub_url("https://bob:other@example.com/readme?q=x#top"));
+        assert_eq!(
+            plain,
+            scrub_url("https://bob:other@example.com/readme?q=x#top")
+        );
     }
 
     #[test]
     fn empty_paths_ignore_credentials_query_and_fragment() {
-        assert_eq!(scrub_url("https://example.com"),
-                   scrub_url("https://alice:secret@example.com?q=x#top"));
+        assert_eq!(
+            scrub_url("https://example.com"),
+            scrub_url("https://alice:secret@example.com?q=x#top")
+        );
     }
 
     #[test]
@@ -235,10 +346,17 @@ mod tests {
         let mut guarded = vec![0x7fu8; capacity + 2];
         // SAFETY: input is a C literal; the interior has capacity writable bytes.
         let short = unsafe {
-            kit_telemetry_scrub_url(input.as_ptr(), guarded.as_mut_ptr().add(1).cast(), capacity - 1)
+            kit_telemetry_scrub_url(
+                input.as_ptr(),
+                guarded.as_mut_ptr().add(1).cast(),
+                capacity - 1,
+            )
         };
         assert_eq!(short, 0, "payload-only space must be rejected");
-        assert!(guarded.iter().all(|&byte| byte == 0x7f), "rejection must not write");
+        assert!(
+            guarded.iter().all(|&byte| byte == 0x7f),
+            "rejection must not write"
+        );
         // SAFETY: the same interior now includes space for the terminator.
         let written = unsafe {
             kit_telemetry_scrub_url(input.as_ptr(), guarded.as_mut_ptr().add(1).cast(), capacity)
@@ -253,7 +371,10 @@ mod tests {
     #[test]
     fn emails_and_ips_are_tagged() {
         assert_eq!(scrub_line("mail bob@example.com now"), "mail [EMAIL] now");
-        assert_eq!(scrub_line("from 192.168.1.10 to 10.0.0.1"), "from [IP] to [IP]");
+        assert_eq!(
+            scrub_line("from 192.168.1.10 to 10.0.0.1"),
+            "from [IP] to [IP]"
+        );
         assert_eq!(scrub_line("v6 ::1 here"), "v6 [IP] here");
     }
 
@@ -266,9 +387,9 @@ mod tests {
     fn aggregation_is_json_ready_and_sorted() {
         let mut agg = Aggregator::new();
         for _ in 0..3 {
-            agg.observe("alpha");
+            agg.observe("alpha").unwrap();
         }
-        agg.observe("beta");
+        agg.observe("beta").unwrap();
         let json = agg.to_json();
         assert!(json.starts_with('{'));
         assert!(json.contains("\"alpha\": 3"));
@@ -280,12 +401,124 @@ mod tests {
     fn merge_adds_counts() {
         let mut a = Aggregator::new();
         let mut b = Aggregator::new();
-        a.observe("x");
-        b.observe("x");
-        b.observe("y");
-        a.merge(&b);
+        a.observe("x").unwrap();
+        b.observe("x").unwrap();
+        b.observe("y").unwrap();
+        a.merge(&b).unwrap();
         let json = a.to_json();
         assert!(json.contains("\"x\": 2"));
         assert!(json.contains("\"y\": 1"));
+    }
+
+    fn bounded(keys: usize, key_bytes: usize, total_bytes: usize) -> Aggregator {
+        Aggregator::with_limits(AggregationLimits {
+            max_keys: keys,
+            max_key_bytes: key_bytes,
+            max_total_key_bytes: total_bytes,
+        })
+    }
+
+    #[test]
+    fn capacity_allows_existing_keys_and_rejects_new_ones() {
+        let mut agg = bounded(1, 1, 1);
+        agg.observe("a").unwrap();
+        agg.observe("a").unwrap();
+        assert_eq!(agg.observe("b"), Err(AggregationError::KeyLimit));
+        assert_eq!(agg.counts, BTreeMap::from([("a".to_string(), 2)]));
+        assert_eq!(agg.retained_key_bytes(), 1);
+        assert_eq!(
+            bounded(0, 0, 0).observe(""),
+            Err(AggregationError::KeyLimit)
+        );
+        let mut empty_key = bounded(1, 0, 0);
+        empty_key.observe("").unwrap();
+        assert_eq!(empty_key.retained_key_bytes(), 0);
+    }
+
+    #[test]
+    fn key_limits_count_utf8_bytes_and_preserve_state() {
+        let mut agg = bounded(3, 2, 3);
+        assert_eq!(agg.observe("猫"), Err(AggregationError::KeyBytesLimit));
+        agg.observe("é").unwrap();
+        agg.observe("a").unwrap();
+        let before = agg.to_json();
+        assert_eq!(agg.observe("b"), Err(AggregationError::TotalKeyBytesLimit));
+        assert_eq!(agg.to_json(), before);
+        assert_eq!(agg.retained_key_bytes(), 3);
+    }
+
+    #[test]
+    fn count_overflow_and_late_merge_failure_are_atomic() {
+        let mut agg = bounded(2, 1, 2);
+        agg.observe("z").unwrap();
+        agg.counts.insert("z".to_string(), u64::MAX);
+        let before = agg.to_json();
+        assert_eq!(agg.observe("z"), Err(AggregationError::CountOverflow));
+        let mut other = bounded(2, 1, 2);
+        other.observe_line("a z").unwrap();
+        let source_before = other.to_json();
+        assert_eq!(agg.merge(&other), Err(AggregationError::CountOverflow));
+        assert_eq!(agg.to_json(), before);
+        assert_eq!(agg.retained_key_bytes(), 1);
+        assert_eq!(other.to_json(), source_before);
+    }
+
+    #[test]
+    fn merge_uses_destination_limits_and_is_atomic() {
+        for (mut dest, expected) in [
+            (bounded(1, 2, 4), AggregationError::KeyLimit),
+            (bounded(3, 1, 4), AggregationError::KeyBytesLimit),
+            (bounded(3, 2, 2), AggregationError::TotalKeyBytesLimit),
+        ] {
+            dest.observe("a").unwrap();
+            let mut source = Aggregator::new();
+            source.observe_line("a zz").unwrap();
+            let before = dest.to_json();
+            let source_before = source.to_json();
+            assert_eq!(dest.merge(&source), Err(expected));
+            assert_eq!(dest.to_json(), before);
+            assert_eq!(dest.retained_key_bytes(), 1);
+            assert_eq!(source.to_json(), source_before);
+        }
+    }
+
+    #[test]
+    fn rejected_lines_preserve_prior_counts() {
+        let mut agg = bounded(2, 1, 2);
+        agg.observe("a").unwrap();
+        let before = agg.to_json();
+        assert_eq!(agg.observe_line("a b c"), Err(AggregationError::KeyLimit));
+        assert_eq!(
+            agg.observe_line("a zz"),
+            Err(AggregationError::KeyBytesLimit)
+        );
+        assert_eq!(agg.to_json(), before);
+        assert_eq!(agg.retained_key_bytes(), 1);
+        agg.observe_line("a b a").unwrap();
+        assert_eq!(
+            agg.counts,
+            BTreeMap::from([("a".into(), 3), ("b".into(), 1)])
+        );
+    }
+
+    #[test]
+    fn accepted_trace_matches_reference_counts_and_tie_order() {
+        let mut agg = bounded(4, 4, 16);
+        let mut reference = BTreeMap::<String, u64>::new();
+        for token in ["b", "a", "é", "b", "é", "a", "d"] {
+            agg.observe(token).unwrap();
+            *reference.entry(token.to_string()).or_default() += 1;
+        }
+        let mut incoming = bounded(4, 4, 16);
+        incoming.observe_line("d a").unwrap();
+        agg.merge(&incoming).unwrap();
+        *reference.get_mut("d").unwrap() += 1;
+        *reference.get_mut("a").unwrap() += 1;
+        assert_eq!(agg.counts, reference);
+        assert_eq!(agg.retained_key_bytes(), 5);
+        assert_eq!(
+            agg.to_json(),
+            "{\n  \"a\": 3,\n  \"b\": 2,\n  \"d\": 2,\n  \"é\": 2\n}"
+        );
     }
 }
