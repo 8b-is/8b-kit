@@ -35,7 +35,7 @@ where `mmap` is in the standard library.
 
 ## Canonical implementation
 
-`8b-is/aurora` PR #5 — `tools/zero_copy_snapshot.py`. Stdlib only, `AURSNAP1`
+[Aurora PR #5](https://github.com/8b-is/aurora/pull/5) — `tools/zero_copy_snapshot.py`. Stdlib only, `AURSNAP1`
 format, no third-party dependency, with a self-check covering rotation under a
 live reader, truncation rejected before mapping, and digest failure on a
 flipped byte. That is the reference; do not write a second layout.
@@ -48,3 +48,12 @@ flipped byte. That is the reference; do not write a second layout.
   crate, rather than taxing every user of the core.
 - The `SIGBUS` invariants are recorded here so the next implementer does not
   rediscover them by crashing.
+
+## Limits of the mapping contract
+
+Immutable replacement protects readers only when all writers cooperate. Mode
+`0400` does not stop a privileged process, the owner changing permissions, or
+an already-open writable descriptor from truncating an inode. `MADV_WILLNEED`
+is advisory, and a successful digest check cannot prevent later I/O faults.
+Validate physical size before mapping and header bounds before exposing data;
+never treat these checks as a guarantee that `SIGBUS` is impossible.
