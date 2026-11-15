@@ -69,6 +69,23 @@ bool kit_mem16_verified(uint32_t i);
  * written excluding the NUL; 0 on failure. */
 size_t kit_telemetry_scrub_url(const char *url, char *out, size_t out_len);
 
+/* ── WiCi wireless GPU & Sparse MoE decision lane (zero-float p/q) ──────── */
+
+struct kit_wici_trace; /* opaque: cyclic token/training trace replay engine */
+
+struct kit_wici_trace *kit_wici_trace_new(uint8_t trigger_op);
+void kit_wici_trace_free(struct kit_wici_trace *trace);
+uint8_t kit_wici_trace_step(struct kit_wici_trace *trace, uint8_t op_id);
+
+bool kit_wici_step_latency_us(uint32_t t_local_us, uint32_t n_calls,
+                              uint32_t rtt_us, uint32_t payload_bytes,
+                              uint32_t rate_mbps, int32_t *num_out,
+                              uint32_t *den_out);
+
+bool kit_wici_should_cache_tensor(uint64_t tensor_bytes,
+                                  uint32_t hash_rate_mb_s,
+                                  uint32_t link_mbps, uint32_t rtt_us);
+
 #ifdef __cplusplus
 }
 #endif

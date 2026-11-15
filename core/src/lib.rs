@@ -17,5 +17,6 @@ pub mod phoenix;
 pub mod rational;
 pub mod telemetry;
 pub mod wave;
+pub mod wici;
 
 pub use rational::Rational;
