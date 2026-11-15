@@ -1,8 +1,11 @@
 //! WiCi Wireless GPU & Sparse MoE Decision Core (`arXiv:2608.24204v1` × `8b-is`).
 //!
-//! Implements the four core mechanisms of Wireless GPU Computing Infrastructure
+//! Models decisions for Wireless GPU Computing Infrastructure
 //! (WiCi) in 100% integer and reduced `p/q` (`Rational`) arithmetic with zero
 //! floating-point operations and zero external dependencies:
+//!
+//! These types do not intercept CUDA calls, transmit packets, or execute GPU work.
+//! Callers retain operation parameters and replay any skipped prefix on divergence.
 //!
 //! 1. **Exact `p/q` Wireless GPU Latency Model (§3.3 Eq. 1)**:
 //!    $$T_{\text{WiCi}} = T_{\text{Local}} + N \cdot \text{RTT} + \frac{D \cdot 8}{\text{Rate}_{\text{Mbps}}}$$
@@ -86,7 +89,13 @@ impl WiciPacketHeader {
         payload_len: u32,
     ) -> Self {
         let k = kind as u8;
-        let seal = Self::compute_seal(WICI_GATE_MAGIC, k, total_fragments, fragment_id, payload_len);
+        let seal = Self::compute_seal(
+            WICI_GATE_MAGIC,
+            k,
+            total_fragments,
+            fragment_id,
+            payload_len,
+        );
         Self {
             magic: WICI_GATE_MAGIC,
             payload_kind: k,
@@ -133,7 +142,16 @@ impl WiciPacketHeader {
         let tf = self.total_fragments.to_le_bytes();
         let fid = self.fragment_id.to_le_bytes();
         let s = self.seal16.to_le_bytes();
-        [self.magic, self.payload_kind, tf[0], tf[1], fid[0], fid[1], s[0], s[1]]
+        [
+            self.magic,
+            self.payload_kind,
+            tf[0],
+            tf[1],
+            fid[0],
+            fid[1],
+            s[0],
+            s[1],
+        ]
     }
 
     pub const fn from_bytes(b: [u8; 8]) -> Self {
@@ -198,9 +216,13 @@ pub const fn wici_should_cache_tensor(
         return false;
     }
     // 1 MB/s = 1 byte/us.
-    let hash_us = (tensor_bytes / (hash_rate_mb_s as u64)).saturating_add(rtt_us as u64);
-    let tx_us = tensor_bytes.saturating_mul(8) / (link_mbps as u64);
-    hash_us < tx_us
+    // Compare exact costs without flooring either side or saturating large tensors.
+    let bytes = tensor_bytes as u128;
+    let hash_rate = hash_rate_mb_s as u128;
+    let link_rate = link_mbps as u128;
+    let cache_cost = bytes * link_rate + rtt_us as u128 * hash_rate * link_rate;
+    let stream_cost = bytes * 8 * hash_rate;
+    cache_cost < stream_cost
 }
 
 /// User-mode GPU driver operation classes intercepted by WiCi (§4.2.1 Fig. 7c + MoE/QAT).
@@ -306,7 +328,12 @@ impl WiciBatcher {
             return WiciBatchAction::FlushAndRetry;
         }
 
-        self.total_ops_seen += 1;
+        self.total_ops_seen = self.total_ops_seen.saturating_add(1);
+        if self.pending_len == 0 && param_bytes > WICI_MEMNET_MTU_BYTES {
+            // The transport must fragment this call; it cannot fit in a batch.
+            self.total_rtts_emitted = self.total_rtts_emitted.saturating_add(1);
+            return WiciBatchAction::FlushFallbackImmediate;
+        }
         if self.pending_len == 0 {
             match op {
                 WiciDriverOp::CuMemCpyHToDAsync
@@ -317,11 +344,11 @@ impl WiciBatcher {
                     self.pending_ops[0] = op as u8;
                     self.pending_len = 1;
                     self.pending_bytes = param_bytes;
-                    self.speculative_acks += 1;
+                    self.speculative_acks = self.speculative_acks.saturating_add(1);
                     return WiciBatchAction::SpeculativeAckLocal;
                 }
                 _ => {
-                    self.total_rtts_emitted += 1;
+                    self.total_rtts_emitted = self.total_rtts_emitted.saturating_add(1);
                     return WiciBatchAction::FlushFallbackImmediate;
                 }
             }
@@ -337,7 +364,7 @@ impl WiciBatcher {
             | (Some(WiciDriverOp::CuBackwardGradAccum), WiciDriverOp::CuQatTritFlipUpdate) => {
                 self.pending_len = 0;
                 self.pending_bytes = 0;
-                self.total_rtts_emitted += 1;
+                self.total_rtts_emitted = self.total_rtts_emitted.saturating_add(1);
                 WiciBatchAction::FlushCoalescedBatch
             }
             // Independent kernel launches (`cuLaunchKernel -> cuLaunchKernel`) or chained async copies:
@@ -348,20 +375,20 @@ impl WiciBatcher {
                 self.pending_ops[self.pending_len] = op as u8;
                 self.pending_len += 1;
                 self.pending_bytes = self.pending_bytes.saturating_add(param_bytes);
-                self.speculative_acks += 1;
+                self.speculative_acks = self.speculative_acks.saturating_add(1);
                 WiciBatchAction::SpeculativeAckLocal
             }
             // Launch stream followed by synchronize flushes the whole kernel wave in 1 RTT!
             (Some(WiciDriverOp::CuLaunchKernel), WiciDriverOp::CuStreamSynchronize) => {
                 self.pending_len = 0;
                 self.pending_bytes = 0;
-                self.total_rtts_emitted += 1;
+                self.total_rtts_emitted = self.total_rtts_emitted.saturating_add(1);
                 WiciBatchAction::FlushCoalescedBatch
             }
             _ => {
                 self.pending_len = 0;
                 self.pending_bytes = 0;
-                self.total_rtts_emitted += 1;
+                self.total_rtts_emitted = self.total_rtts_emitted.saturating_add(1);
                 WiciBatchAction::FlushFallbackImmediate
             }
         }
@@ -372,7 +399,7 @@ impl WiciBatcher {
         if self.pending_len > 0 {
             self.pending_len = 0;
             self.pending_bytes = 0;
-            self.total_rtts_emitted += 1;
+            self.total_rtts_emitted = self.total_rtts_emitted.saturating_add(1);
             true
         } else {
             false
@@ -481,8 +508,10 @@ impl WiciTraceEngine {
                     self.cursor += 1;
                     if self.cursor == self.recorded_len {
                         self.cursor = 0;
-                        self.replays_completed += 1;
-                        self.rtts_saved_by_replay += (self.recorded_len.saturating_sub(1)) as u64;
+                        self.replays_completed = self.replays_completed.saturating_add(1);
+                        self.rtts_saved_by_replay = self
+                            .rtts_saved_by_replay
+                            .saturating_add(self.recorded_len.saturating_sub(1) as u64);
                         WiciTraceVerdict::EmitSingleTriggerFrame
                     } else {
                         WiciTraceVerdict::ReplaySkipLocal
@@ -519,7 +548,8 @@ pub struct WiciMoeTierPlan {
     pub nvme_used_mib: u32,
     /// Number of routed experts per layer that fit in VRAM + Host RAM without NVMe page-in.
     pub zero_disk_experts_per_layer: u16,
-    /// True when 100% of active per-token parameters fit in VRAM + Host RAM.
+    /// Capacity heuristic: all weights fit locally and VRAM holds half the active footprint.
+    /// This does not account for activations, KV cache, workspace, or execution overhead.
     pub fits_zero_cloud: bool,
 }
 
@@ -530,7 +560,8 @@ pub struct WiciMoeTierPlan {
 /// - `active_params_billions`: e.g. `37` for DeepSeek-V3/R1
 /// - `experts_per_layer`: e.g. `256`
 /// - `bits_num` / `bits_den`: bits per parameter as exact rational (e.g. `1585 / 1000` for
-///   `base-243` `SPQT` ternary `1.585 bits/trit`, or `4 / 1` for `nvfp4`)
+///   an idealized ternary approximation, `8 / 5` for five packed trits per byte,
+///   or `4 / 1` for `nvfp4`)
 pub const fn plan_moe_tiers(
     total_params_billions: u32,
     active_params_billions: u32,
@@ -541,17 +572,23 @@ pub const fn plan_moe_tiers(
     ram_budget_mib: u32,
     nvme_budget_mib: u32,
 ) -> Option<WiciMoeTierPlan> {
-    if bits_den == 0 || total_params_billions == 0 || active_params_billions > total_params_billions
+    if bits_den == 0
+        || bits_num == 0
+        || total_params_billions == 0
+        || active_params_billions > total_params_billions
     {
         return None;
     }
-    // 1 billion params * (bits_num / bits_den) bits = (1000 / 8) * (bits_num / bits_den) MiB
-    // = (125 * bits_num) / bits_den MiB per billion parameters (using 10^9 / 8 / 10^6 = 125).
-    let total_mib = ((total_params_billions as u64) * 125 * (bits_num as u64)) / (bits_den as u64);
-    let active_mib =
-        ((active_params_billions as u64) * 125 * (bits_num as u64)) / (bits_den as u64);
+    // One billion is decimal; one MiB is 2^20 bytes. Round storage up so
+    // fractional MiB never silently exceed a tier's advertised capacity.
+    // u128 holds every intermediate product for the u32 public inputs.
+    let denominator = 8_u128 * 1_048_576 * bits_den as u128;
+    let total_bits = total_params_billions as u128 * 1_000_000_000 * bits_num as u128;
+    let active_bits = active_params_billions as u128 * 1_000_000_000 * bits_num as u128;
+    let total_mib = total_bits.div_ceil(denominator);
+    let active_mib = active_bits.div_ceil(denominator);
 
-    if total_mib > u32::MAX as u64 {
+    if total_mib > u32::MAX as u128 {
         return None;
     }
     let total_model_mib = total_mib as u32;
@@ -589,9 +626,10 @@ pub const fn plan_moe_tiers(
         (((experts_per_layer as u64) * covered_in_fast_mem) / (total_model_mib as u64)) as u16
     };
 
-    let fits_zero_cloud = (vram_budget_mib as u64) + (ram_budget_mib as u64) + (nvme_budget_mib as u64)
-        >= (total_model_mib as u64)
-        && (vram_budget_mib >= hot_backbone_mib / 2);
+    let fits_zero_cloud =
+        (vram_budget_mib as u64) + (ram_budget_mib as u64) + (nvme_budget_mib as u64)
+            >= (total_model_mib as u64)
+            && (vram_budget_mib >= hot_backbone_mib.div_ceil(2));
 
     Some(WiciMoeTierPlan {
         total_model_mib,
@@ -761,18 +799,30 @@ mod tests {
         assert_eq!(batcher.total_ops_seen, 60);
         assert_eq!(batcher.total_rtts_emitted, 10);
         // Saved 50 / 60 = 5 / 6 (83.33% > WiCi's 80.4% benchmark!).
-        assert_eq!(batcher.rtt_savings_ratio().unwrap(), Rational::new(5, 6).unwrap());
+        assert_eq!(
+            batcher.rtt_savings_ratio().unwrap(),
+            Rational::new(5, 6).unwrap()
+        );
     }
 
     #[test]
     fn batch_overflow_preserves_pending_ops_and_requires_retry() {
         let mut b = WiciBatcher::new();
-        assert_eq!(b.push_op(WiciDriverOp::CuLaunchKernel, 1000), WiciBatchAction::SpeculativeAckLocal);
-        assert_eq!(b.push_op(WiciDriverOp::CuLaunchKernel, 500), WiciBatchAction::FlushAndRetry);
+        assert_eq!(
+            b.push_op(WiciDriverOp::CuLaunchKernel, 1000),
+            WiciBatchAction::SpeculativeAckLocal
+        );
+        assert_eq!(
+            b.push_op(WiciDriverOp::CuLaunchKernel, 500),
+            WiciBatchAction::FlushAndRetry
+        );
         assert_eq!(b.pending_count(), 1);
         assert_eq!(b.total_ops_seen, 1);
         assert!(b.flush());
-        assert_eq!(b.push_op(WiciDriverOp::CuLaunchKernel, 500), WiciBatchAction::SpeculativeAckLocal);
+        assert_eq!(
+            b.push_op(WiciDriverOp::CuLaunchKernel, 500),
+            WiciBatchAction::SpeculativeAckLocal
+        );
         assert_eq!(b.total_ops_seen, 2);
     }
 
@@ -808,7 +858,10 @@ mod tests {
         for &op in &cycle[1..4] {
             assert_eq!(trace.step(op), WiciTraceVerdict::ReplaySkipLocal);
         }
-        assert_eq!(trace.step(cycle[4]), WiciTraceVerdict::EmitSingleTriggerFrame);
+        assert_eq!(
+            trace.step(cycle[4]),
+            WiciTraceVerdict::EmitSingleTriggerFrame
+        );
         assert_eq!(trace.replays_completed, 1);
         assert_eq!(trace.rtts_saved_by_replay, 4);
 
@@ -822,32 +875,59 @@ mod tests {
 
     #[test]
     fn deepseek_671b_moe_fits_hetzner_a6000_ram_and_local_4090_tforce_nvme() {
-        // 1. Hetzner A6000 box: 49,140 MiB VRAM + 737,280 MiB (720 GiB) RAM, base-243 ternary (1585/1000 bits/trit).
-        // 671B * 125 * 1.585 = 132,941 MiB (~130 GiB) total -> 100% fits in VRAM + RAM with 0 NVMe page-ins!
+        // 1. Hetzner A6000 box: 49,140 MiB VRAM + 737,280 MiB (720 GiB) RAM, idealized ternary (1585/1000 bits/trit).
+        // Round 671 billion * 1585/1000 bits up to 126,784 binary MiB.
         let hetzner = plan_moe_tiers(671, 37, 256, 1585, 1000, 49_140, 737_280, 0).unwrap();
-        assert_eq!(hetzner.total_model_mib, 132_941);
+        assert_eq!(hetzner.total_model_mib, 126_784);
         assert_eq!(hetzner.vram_used_mib, 49_140);
-        assert_eq!(hetzner.ram_used_mib, 83_801);
+        assert_eq!(hetzner.ram_used_mib, 77_644);
         assert_eq!(hetzner.nvme_used_mib, 0);
         assert_eq!(hetzner.zero_disk_experts_per_layer, 256);
         assert!(hetzner.fits_zero_cloud);
 
-        // Even at 8-bit (`8/1`), 671B = 671,000 MiB (~655 GiB) -> STILL fits 100% in Hetzner's 48GB VRAM + 720GB RAM!
+        // At 8 bits per parameter, the weight footprint rounds up to 639,916 MiB.
         let hetzner_q8 = plan_moe_tiers(671, 37, 256, 8, 1, 49_140, 737_280, 0).unwrap();
-        assert_eq!(hetzner_q8.total_model_mib, 671_000);
+        assert_eq!(hetzner_q8.total_model_mib, 639_916);
         assert_eq!(hetzner_q8.nvme_used_mib, 0);
         assert_eq!(hetzner_q8.zero_disk_experts_per_layer, 256);
         assert!(hetzner_q8.fits_zero_cloud);
 
         // 2. Local RTX 4090 box: 24,564 MiB VRAM + 128,000 MiB RAM + 1,843,200 MiB (1.8 TiB T-FORCE TM8FPP002T NVMe).
-        // At base-243 ternary (132,941 MiB), 100% fits in VRAM + 125 GiB RAM!
-        // At 4-bit nvfp4 (335,500 MiB), 24.5 GiB in VRAM + 128 GiB in RAM + 182.9 GiB on T-FORCE NVMe!
-        let local_nvfp4 =
-            plan_moe_tiers(671, 37, 256, 4, 1, 24_564, 128_000, 1_843_200).unwrap();
-        assert_eq!(local_nvfp4.total_model_mib, 335_500);
+        // This is a weight-capacity scenario, not a measured deployment.
+        // At 4 bits per parameter, 167,394 MiB spill to NVMe with these budgets.
+        let local_nvfp4 = plan_moe_tiers(671, 37, 256, 4, 1, 24_564, 128_000, 1_843_200).unwrap();
+        assert_eq!(local_nvfp4.total_model_mib, 319_958);
         assert_eq!(local_nvfp4.vram_used_mib, 24_564);
         assert_eq!(local_nvfp4.ram_used_mib, 128_000);
-        assert_eq!(local_nvfp4.nvme_used_mib, 182_936);
+        assert_eq!(local_nvfp4.nvme_used_mib, 167_394);
         assert!(local_nvfp4.fits_zero_cloud);
+    }
+    #[test]
+    fn tier_sizes_round_up_binary_mib_and_reject_unrepresentable_inputs() {
+        let plan = plan_moe_tiers(1, 1, 1, 8, 5, 1_000, 0, 0).unwrap();
+        assert_eq!(plan.total_model_mib, 191);
+        assert!(plan_moe_tiers(1, 1, 1, 0, 1, 100, 0, 0).is_none());
+        assert!(plan_moe_tiers(u32::MAX, 1, 1, u32::MAX, 1, u32::MAX, 0, 0).is_none());
+    }
+
+    #[test]
+    fn cache_costs_compare_exact_fractions_at_large_sizes() {
+        assert!(wici_should_cache_tensor(u64::MAX, u32::MAX, u32::MAX, 0));
+        // Both rounded costs would be equal, but hashing is strictly cheaper.
+        assert!(wici_should_cache_tensor(65_537, 65_537, 524_295, 0));
+        assert!(!wici_should_cache_tensor(65_536, 8, 64, 0));
+    }
+    #[test]
+    fn oversized_single_call_is_not_buffered_and_counters_do_not_wrap() {
+        let mut batcher = WiciBatcher::new();
+        batcher.total_ops_seen = u64::MAX;
+        batcher.total_rtts_emitted = u64::MAX;
+        assert_eq!(
+            batcher.push_op(WiciDriverOp::CuLaunchKernel, usize::MAX),
+            WiciBatchAction::FlushFallbackImmediate
+        );
+        assert_eq!(batcher.pending_count(), 0);
+        assert_eq!(batcher.total_ops_seen, u64::MAX);
+        assert_eq!(batcher.total_rtts_emitted, u64::MAX);
     }
 }
