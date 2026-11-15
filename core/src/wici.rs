@@ -257,6 +257,8 @@ pub enum WiciBatchAction {
     FlushCoalescedBatch = 1,
     /// Pattern broken or immediate barrier: flush pending + current immediately.
     FlushFallbackImmediate = 2,
+    /// Pending operations must be flushed, then the caller must retry this operation.
+    FlushAndRetry = 3,
 }
 
 /// Speculative function batcher implementing WiCi §4.2.1 within a `1450B` MEMNET MTU budget.
@@ -294,20 +296,17 @@ impl WiciBatcher {
 
     /// Submit one intercepted user-mode driver call (`op`, `param_bytes`).
     pub fn push_op(&mut self, op: WiciDriverOp, param_bytes: usize) -> WiciBatchAction {
-        self.total_ops_seen += 1;
-
         // If adding this op would exceed the 1450B MEMNET MTU or 32-op slot cap, flush now.
         if self.pending_len >= self.pending_ops.len()
             || (self.pending_len > 0
                 && self.pending_bytes.saturating_add(param_bytes) > WICI_MEMNET_MTU_BYTES)
         {
-            self.pending_ops[0] = op as u8;
-            self.pending_len = 1;
-            self.pending_bytes = param_bytes;
-            self.total_rtts_emitted += 1;
-            return WiciBatchAction::FlushCoalescedBatch;
+            // Do not overwrite buffered operations or count the unaccepted call.
+            // The caller must flush() and retry this same operation.
+            return WiciBatchAction::FlushAndRetry;
         }
 
+        self.total_ops_seen += 1;
         if self.pending_len == 0 {
             match op {
                 WiciDriverOp::CuMemCpyHToDAsync
@@ -386,6 +385,9 @@ impl WiciBatcher {
             return None;
         }
         let saved = self.total_ops_seen.saturating_sub(self.total_rtts_emitted);
+        if saved > i32::MAX as u64 {
+            return None;
+        }
         Rational::new(saved as i32, self.total_ops_seen as u32)
     }
 }
@@ -760,6 +762,26 @@ mod tests {
         assert_eq!(batcher.total_rtts_emitted, 10);
         // Saved 50 / 60 = 5 / 6 (83.33% > WiCi's 80.4% benchmark!).
         assert_eq!(batcher.rtt_savings_ratio().unwrap(), Rational::new(5, 6).unwrap());
+    }
+
+    #[test]
+    fn batch_overflow_preserves_pending_ops_and_requires_retry() {
+        let mut b = WiciBatcher::new();
+        assert_eq!(b.push_op(WiciDriverOp::CuLaunchKernel, 1000), WiciBatchAction::SpeculativeAckLocal);
+        assert_eq!(b.push_op(WiciDriverOp::CuLaunchKernel, 500), WiciBatchAction::FlushAndRetry);
+        assert_eq!(b.pending_count(), 1);
+        assert_eq!(b.total_ops_seen, 1);
+        assert!(b.flush());
+        assert_eq!(b.push_op(WiciDriverOp::CuLaunchKernel, 500), WiciBatchAction::SpeculativeAckLocal);
+        assert_eq!(b.total_ops_seen, 2);
+    }
+
+    #[test]
+    fn large_rtt_savings_counter_does_not_wrap_signed_numerator() {
+        let mut b = WiciBatcher::new();
+        b.total_ops_seen = i32::MAX as u64 + 2;
+        b.total_rtts_emitted = 1;
+        assert!(b.rtt_savings_ratio().is_none());
     }
 
     #[test]
