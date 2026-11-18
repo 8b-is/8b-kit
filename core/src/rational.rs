@@ -16,8 +16,11 @@ impl Rational {
             return None;
         }
         let g = gcd((num as i64).unsigned_abs() as u32, den);
+        // Divide in i64: for `num == i32::MIN` the gcd can be 2^31, which
+        // does not fit in i32 and would flip the sign if narrowed first.
+        // The quotient's magnitude never exceeds `|num|`, so it fits i32.
         Some(Self {
-            num: num / g as i32,
+            num: (i64::from(num) / i64::from(g)) as i32,
             den: den / g,
         })
     }
@@ -51,8 +54,17 @@ impl Rational {
         Self::new(n as i32, d as u32)
     }
 
-    /// `floor(log2(|self|) * 32)` — 5 fractional bits, matching MEM8
+    /// Approximate `log2(|self|) * 32` — 5 fractional bits, matching MEM8
     /// `log2_q5_rational`. `None` for zero.
+    ///
+    /// Method: for numerator and denominator separately, the integer part is
+    /// the position of the leading bit and the fraction is the next five
+    /// mantissa bits (piecewise-linear between powers of two); the result is
+    /// the difference. This is not the exact floor: each term sits below the
+    /// true `log2 * 32` by less than 4 units (interpolation gap, worst near
+    /// mantissa 1.44, plus truncation of the lower mantissa bits), so the
+    /// difference can be off in either direction. E.g. 73/100 yields -14
+    /// where the exact floor is -15.
     pub fn log2_q5(self) -> Option<i32> {
         if self.num == 0 {
             return None;
@@ -97,6 +109,17 @@ mod tests {
         assert_eq!(r, Rational::new(1, 2).unwrap());
         let neg = Rational::new(-3, 9).unwrap();
         assert_eq!((neg.num, neg.den), (-1, 3));
+    }
+
+    #[test]
+    fn reduction_keeps_the_sign_at_the_i32_min_edge() {
+        // gcd(2^31, 2^31) = 2^31 does not fit in i32; the reduced value is -1.
+        let r = Rational::new(i32::MIN, 1 << 31).unwrap();
+        assert_eq!((r.num, r.den), (-1, 1));
+        let half = Rational::new(i32::MIN, u32::MAX - 1).unwrap();
+        assert_eq!((half.num, half.den), (-(1 << 30), (1 << 31) - 1));
+        let whole = Rational::new(i32::MIN, 1).unwrap();
+        assert_eq!((whole.num, whole.den), (i32::MIN, 1));
     }
 
     #[test]
