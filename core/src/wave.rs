@@ -162,7 +162,13 @@ pub fn checksum(bytes: &[u8]) -> u8 {
     for chunk in chunks.chunks_exact(8) {
         acc ^= u64::from_le_bytes(chunk.try_into().unwrap());
     }
-    let mut out = (acc ^ (acc >> 32) ^ (acc >> 16) ^ (acc >> 8) ^ acc) as u8;
+    // Fold the eight byte lanes into the low byte. Each step must feed the
+    // next: a single expression that XORs `acc` with itself cancels lanes
+    // and leaves bytes of every chunk uncovered.
+    acc ^= acc >> 32;
+    acc ^= acc >> 16;
+    acc ^= acc >> 8;
+    let mut out = acc as u8;
     for b in tail {
         out ^= b;
     }
@@ -309,6 +315,36 @@ mod tests {
         assert_eq!(z, 0);
         assert_eq!(y, 63);
         assert_eq!(x, 128);
+    }
+
+    #[test]
+    fn checksum_is_the_bytewise_xor_of_the_swift_reference() {
+        // Swift: `bytes.reduce(0 as UInt8, ^)`. Every length and every byte
+        // position must agree with that fold, including the u64-chunked part.
+        let mut body = [0u8; 78];
+        for (i, b) in body.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        for len in 0..=body.len() {
+            let reference = body[..len].iter().fold(0u8, |acc, b| acc ^ b);
+            assert_eq!(checksum(&body[..len]), reference, "length {len}");
+        }
+    }
+
+    #[test]
+    fn checksum_catches_a_flip_at_every_body_position() {
+        let frame = sample().to_frame();
+        for i in 0..78 {
+            for bit in 0..8 {
+                let mut flipped = frame;
+                flipped[i] ^= 1 << bit;
+                assert_ne!(
+                    checksum(&flipped[..78]),
+                    frame[78],
+                    "flip of byte {i} bit {bit} went undetected"
+                );
+            }
+        }
     }
 
     #[test]
